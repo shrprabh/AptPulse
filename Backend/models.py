@@ -136,6 +136,8 @@ class Identity(Base, TimestampMixin):
     provider_user_id = Column(String(255), nullable=True, index=True)
 
     is_verified = Column(Boolean, default=False, nullable=False)
+    
+    verified_at = Column(DateTime(timezone=True), nullable=True)
 
     user = relationship("User", back_populates="identities")
 
@@ -160,11 +162,17 @@ class EmailVerificationToken(Base, TimestampMixin):
     id = Column(Integer, primary_key=True, index=True)
     identity_id = Column(Integer, ForeignKey("identities.id", ondelete="CASCADE"), nullable=False, index=True)
 
-    token = Column(String(255), nullable=False, unique=True, index=True)
+    # store HASH, not raw token
+    token_hash = Column(String(255), nullable=False, unique=True, index=True)
+
     expires_at = Column(DateTime(timezone=True), nullable=False)
     used_at = Column(DateTime(timezone=True), nullable=True)
 
     identity = relationship("Identity")
+
+    __table_args__ = (
+        Index("ix_email_verify_identity_active", "identity_id", "expires_at"),
+    )
 
 
 class RefreshToken(Base, TimestampMixin):
@@ -181,9 +189,29 @@ class RefreshToken(Base, TimestampMixin):
 
     user_agent = Column(String(255), nullable=True)
     ip_address = Column(String(64), nullable=True)
+    last_used_at = Column(DateTime(timezone=True), nullable=True, index=True)
+
+    # Optional: track rotation chain
+    replaced_by_id = Column(Integer, ForeignKey("refresh_tokens.id", ondelete="SET NULL"), nullable=True)
 
     user = relationship("User", back_populates="refresh_tokens")
 
+class PasswordResetToken(Base, TimestampMixin):
+    __tablename__ = "password_reset_tokens"
+
+    id = Column(Integer, primary_key=True, index=True)
+    identity_id = Column(Integer, ForeignKey("identities.id", ondelete="CASCADE"), nullable=False, index=True)
+
+    token_hash = Column(String(255), nullable=False, unique=True, index=True)
+
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    used_at = Column(DateTime(timezone=True), nullable=True)
+
+    identity = relationship("Identity")
+
+    __table_args__ = (
+        Index("ix_password_reset_identity_active", "identity_id", "expires_at"),
+    )
 
 class OTPCode(Base, TimestampMixin):
     """

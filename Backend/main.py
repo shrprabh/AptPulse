@@ -2,11 +2,11 @@
 # NOTE: For production, replace create_all() with Alembic migrations.
 
 from __future__ import annotations
-
 from datetime import datetime, timedelta, timezone
 import hashlib
 import secrets
 from typing import List, Optional, Annotated, Dict, Set
+from schemas import MemberOut, MemberUpdateIn
 
 from fastapi import (
     FastAPI,
@@ -15,6 +15,7 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
     status,
+    Request
 )
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.openapi.utils import get_openapi
@@ -58,7 +59,7 @@ def custom_openapi():
 app.openapi = custom_openapi
 
 # DEV ONLY (use Alembic in real deployments)
-models.Base.metadata.create_all(bind=engine)
+#models.Base.metadata.create_all(bind=engine)
 
 
 # ----------------------------
@@ -79,40 +80,50 @@ db_dependency = Annotated[Session, Depends(get_db)]
 # Client sends: Authorization: Bearer <token>
 # We store SHA256(token) in refresh_tokens.token_hash (used as session table for beta)
 # ----------------------------
+SESSION_DAYS = 7
+SESSION_RENEW_IF_LT = timedelta(days=2)
+
 def _sha256(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
-def create_session(db: Session, user_id: int, days: int = 30) -> str:
+def create_session(db: Session, user_id: int, request: Request, days: int = SESSION_DAYS) -> str:
     raw = secrets.token_urlsafe(32)
     token_hash = _sha256(raw)
-    expires_at = datetime.now(timezone.utc) + timedelta(days=days)
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(days=days)
 
     db_token = models.RefreshToken(
         user_id=user_id,
         token_hash=token_hash,
         expires_at=expires_at,
         revoked_at=None,
-        user_agent=None,
-        ip_address=None,
+        user_agent=request.headers.get("user-agent"),
+        ip_address=request.client.host if request.client else None,
+        last_used_at=now,
     )
     db.add(db_token)
     db.commit()
     return raw
 
 
+def _user_is_verified(db: Session, user_id: int) -> bool:
+    # Verified if any identity for this user is_verified
+    return (
+        db.query(models.Identity.id)
+        .filter(models.Identity.user_id == user_id, models.Identity.is_verified == True)
+        .first()
+        is not None
+    )
+
+
 def get_current_user(
     db: db_dependency,
     creds: HTTPAuthorizationCredentials = Depends(bearer_scheme),
 ) -> models.User:
-    """
-    This makes Swagger show 'Authorize' and adds Authorization header support.
-    In Swagger Authorize, paste: Bearer <token>
-    """
     if not creds or not creds.credentials:
         raise HTTPException(status_code=401, detail="Missing Authorization: Bearer <token>")
 
-    raw = creds.credentials
-    token_hash = _sha256(raw)
+    token_hash = _sha256(creds.credentials)
 
     token_row = (
         db.query(models.RefreshToken)
@@ -133,6 +144,17 @@ def get_current_user(
     )
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
+
+    # Enforce verification globally (prevents unverified users from using app)
+    if not _user_is_verified(db, user.id):
+        raise HTTPException(status_code=403, detail="Account not verified")
+
+    # update last_used + rolling renewal
+    now = datetime.now(timezone.utc)
+    token_row.last_used_at = now
+    if token_row.expires_at - now < SESSION_RENEW_IF_LT:
+        token_row.expires_at = now + timedelta(days=SESSION_DAYS)
+    db.commit()
 
     return user
 
@@ -353,11 +375,33 @@ def health():
 # ----------------------------
 # AUTH APIs (email flow)
 # ----------------------------
-@app.post("/api/v1/auth/signup/email", response_model=TokenResponse)
-def signup_email(payload: SignupEmail, db: db_dependency):
+def _new_one_time_token() -> str:
+    return secrets.token_urlsafe(32)
+
+def _token_hash(token: str) -> str:
+    return _sha256(token)
+
+class VerifyEmailRequestIn(BaseModel):
+    email: EmailStr
+
+class VerifyEmailConfirmIn(BaseModel):
+    token: str
+
+class ForgotPasswordIn(BaseModel):
+    email: EmailStr
+
+class ResetPasswordIn(BaseModel):
+    token: str
+    new_password: str = Field(min_length=8)
+
+@app.post("/api/v1/auth/signup/email")
+def signup_email(payload: SignupEmail, request: Request, db: db_dependency):
+    email = str(payload.email).lower()
+
     existing = (
         db.query(models.Identity)
-        .filter(models.Identity.provider == models.IdentityProvider.EMAIL, models.Identity.email == str(payload.email).lower())
+        .filter(models.Identity.provider == models.IdentityProvider.EMAIL,
+                models.Identity.email == email)
         .first()
     )
     if existing:
@@ -377,22 +421,37 @@ def signup_email(payload: SignupEmail, db: db_dependency):
     ident = models.Identity(
         user_id=user.id,
         provider=models.IdentityProvider.EMAIL,
-        email=str(payload.email).lower(),
+        email=email,
         password_hash=hash_password(payload.password),
-        is_verified=False,  # beta: you can flip after email verification later
+        is_verified=False,
+        verified_at=None,
     )
     db.add(ident)
     db.commit()
+    db.refresh(ident)
 
-    token = create_session(db, user.id)
-    return TokenResponse(access_token=token)
+    # create verification token (hash stored)
+    raw_token = _new_one_time_token()
+    db.add(models.EmailVerificationToken(
+        identity_id=ident.id,
+        token_hash=_token_hash(raw_token),
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
+        used_at=None,
+    ))
+    db.commit()
+
+    # DEV: return token for testing. PROD: email it.
+    return {"status": "PENDING_VERIFICATION", "verify_token_dev_only": raw_token}
 
 
 @app.post("/api/v1/auth/login/email", response_model=TokenResponse)
-def login_email(payload: LoginEmail, db: db_dependency):
+def login_email(payload: LoginEmail, request: Request, db: db_dependency):
+    email = str(payload.email).lower()
+
     ident = (
         db.query(models.Identity)
-        .filter(models.Identity.provider == models.IdentityProvider.EMAIL, models.Identity.email == str(payload.email).lower())
+        .filter(models.Identity.provider == models.IdentityProvider.EMAIL,
+                models.Identity.email == email)
         .first()
     )
     if not ident or not ident.password_hash:
@@ -401,9 +460,121 @@ def login_email(payload: LoginEmail, db: db_dependency):
     if not verify_password(payload.password, ident.password_hash):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
-    token = create_session(db, ident.user_id)
+    if not ident.is_verified:
+        raise HTTPException(status_code=403, detail="Email not verified")
+
+    token = create_session(db, ident.user_id, request)
     return TokenResponse(access_token=token)
 
+@app.post("/api/v1/auth/verify/email/request")
+def request_email_verification(payload: VerifyEmailRequestIn, db: db_dependency):
+    email = str(payload.email).lower()
+
+    ident = (
+        db.query(models.Identity)
+        .filter(models.Identity.provider == models.IdentityProvider.EMAIL,
+                models.Identity.email == email)
+        .first()
+    )
+
+    # avoid enumeration
+    if not ident:
+        return {"status": "OK"}
+
+    raw_token = _new_one_time_token()
+    db.add(models.EmailVerificationToken(
+        identity_id=ident.id,
+        token_hash=_token_hash(raw_token),
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
+        used_at=None,
+    ))
+    db.commit()
+
+    return {"status": "OK", "verify_token_dev_only": raw_token}
+
+
+@app.post("/api/v1/auth/verify/email/confirm")
+def confirm_email_verification(payload: VerifyEmailConfirmIn, db: db_dependency):
+    token_hash = _token_hash(payload.token)
+    now = datetime.now(timezone.utc)
+
+    row = (
+        db.query(models.EmailVerificationToken)
+        .filter(
+            models.EmailVerificationToken.token_hash == token_hash,
+            models.EmailVerificationToken.used_at.is_(None),
+            models.EmailVerificationToken.expires_at > now,
+        )
+        .first()
+    )
+    if not row:
+        raise HTTPException(status_code=400, detail="Invalid or expired token")
+
+    ident = db.query(models.Identity).filter(models.Identity.id == row.identity_id).first()
+    if not ident:
+        raise HTTPException(status_code=400, detail="Identity not found")
+
+    ident.is_verified = True
+    ident.verified_at = now
+    row.used_at = now
+    db.commit()
+
+    return {"status": "VERIFIED"}
+
+
+@app.post("/api/v1/auth/password/forgot")
+def forgot_password(payload: ForgotPasswordIn, db: db_dependency):
+    email = str(payload.email).lower()
+
+    ident = (
+        db.query(models.Identity)
+        .filter(models.Identity.provider == models.IdentityProvider.EMAIL,
+                models.Identity.email == email)
+        .first()
+    )
+
+    # avoid enumeration
+    if not ident:
+        return {"status": "OK"}
+
+    raw_token = _new_one_time_token()
+    db.add(models.PasswordResetToken(
+        identity_id=ident.id,
+        token_hash=_token_hash(raw_token),
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        used_at=None,
+    ))
+    db.commit()
+
+    return {"status": "OK", "reset_token_dev_only": raw_token}
+
+
+@app.post("/api/v1/auth/password/reset")
+def reset_password(payload: ResetPasswordIn, db: db_dependency):
+    now = datetime.now(timezone.utc)
+    token_hash = _token_hash(payload.token)
+
+    row = (
+        db.query(models.PasswordResetToken)
+        .filter(
+            models.PasswordResetToken.token_hash == token_hash,
+            models.PasswordResetToken.used_at.is_(None),
+            models.PasswordResetToken.expires_at > now,
+        )
+        .first()
+    )
+    if not row:
+        raise HTTPException(status_code=400, detail="Invalid or expired token")
+
+    ident = db.query(models.Identity).filter(models.Identity.id == row.identity_id).first()
+    if not ident:
+        raise HTTPException(status_code=400, detail="Identity not found")
+
+    ident.password_hash = hash_password(payload.new_password)
+    row.used_at = now
+    db.commit()
+
+    return {"status": "PASSWORD_UPDATED"}
 
 @app.post("/api/v1/auth/logout")
 def logout(
@@ -462,6 +633,34 @@ def invite_to_group(group_id: int, payload: InviteCreate, user: user_dependency,
     db.refresh(inv)
 
     return {"invite_token": inv.token, "expires_at": inv.expires_at.isoformat()}
+def _user_matches_invite(db: Session, user_id: int, inv: models.Invitation) -> bool:
+    if inv.invitee_email:
+        return (
+            db.query(models.Identity.id)
+            .filter(
+                models.Identity.user_id == user_id,
+                models.Identity.provider == models.IdentityProvider.EMAIL,
+                models.Identity.email == inv.invitee_email.lower(),
+                models.Identity.is_verified == True,
+            )
+            .first()
+            is not None
+        )
+
+    if inv.invitee_phone_e164:
+        return (
+            db.query(models.Identity.id)
+            .filter(
+                models.Identity.user_id == user_id,
+                models.Identity.provider == models.IdentityProvider.PHONE,
+                models.Identity.phone_e164 == inv.invitee_phone_e164,
+                models.Identity.is_verified == True,
+            )
+            .first()
+            is not None
+        )
+
+    return False
 
 
 @app.post("/api/v1/groups/join/{invite_token}")
@@ -476,13 +675,20 @@ def accept_invite(invite_token: str, user: user_dependency, db: db_dependency):
         db.commit()
         raise HTTPException(status_code=400, detail="Invite expired")
 
+    # SECURITY FIX
+    if not _user_matches_invite(db, user.id, inv):
+        raise HTTPException(status_code=403, detail="This invite is not for your verified account")
+
     existing = (
         db.query(models.GroupMembership)
-        .filter(models.GroupMembership.group_id == inv.group_id, models.GroupMembership.user_id == user.id)
+        .filter(models.GroupMembership.group_id == inv.group_id,
+                models.GroupMembership.user_id == user.id)
         .first()
     )
     if not existing:
         db.add(models.GroupMembership(group_id=inv.group_id, user_id=user.id, role=models.GroupRole.MEMBER, is_active=True))
+    else:
+        existing.is_active = True
 
     inv.status = models.InviteStatus.ACCEPTED
     inv.accepted_by_user_id = user.id
@@ -490,7 +696,6 @@ def accept_invite(invite_token: str, user: user_dependency, db: db_dependency):
     db.commit()
 
     return {"status": "JOINED", "group_id": inv.group_id}
-
 
 # ----------------------------
 # CHORE TYPE APIs
@@ -736,7 +941,12 @@ def create_scheduled_plan(group_id: int, payload: ScheduledPlanCreate, user: use
                 rule_config=None,
             )
         )
+    member_ids = set(_group_member_user_ids(db, group_id))
+    for r in payload.rules:
+        if r.user_id not in member_ids:
+            raise HTTPException(status_code=400, detail=f"user_id {r.user_id} is not a member of the group")
     db.commit()
+ 
 
     # NOTE: actual assignment generation happens via scheduler job (APScheduler) later.
     return {"plan_id": plan.id, "status": "CREATED"}
@@ -836,3 +1046,134 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
         if user_id is not None:
             ws_manager.disconnect(user_id, websocket)
         db.close()
+
+def _active_admin_count(db: Session, group_id: int) -> int:
+    return (
+        db.query(models.GroupMembership.id)
+        .filter(
+            models.GroupMembership.group_id == group_id,
+            models.GroupMembership.is_active == True,
+            models.GroupMembership.role == models.GroupRole.ADMIN,
+        )
+        .count()
+    )
+
+@app.get("/api/v1/groups/{group_id}/members", response_model=list[MemberOut])
+def list_members(group_id: int, user: user_dependency, db: db_dependency):
+    require_group_role(db, group_id, user.id, roles=[models.GroupRole.ADMIN])
+
+    rows = (
+        db.query(models.GroupMembership, models.User)
+        .join(models.User, models.User.id == models.GroupMembership.user_id)
+        .filter(models.GroupMembership.group_id == group_id)
+        .order_by(models.GroupMembership.joined_at.asc())
+        .all()
+    )
+
+    return [
+        MemberOut(
+            user_id=m.user_id,
+            display_name=u.display_name,
+            role=m.role,
+            joined_at=m.joined_at,
+            is_active=m.is_active,
+        )
+        for (m, u) in rows
+    ]
+
+
+@app.patch("/api/v1/groups/{group_id}/members/{member_user_id}")
+def update_member(group_id: int, member_user_id: int, payload: MemberUpdateIn, user: user_dependency, db: db_dependency):
+    require_group_role(db, group_id, user.id, roles=[models.GroupRole.ADMIN])
+
+    m = (
+        db.query(models.GroupMembership)
+        .filter(models.GroupMembership.group_id == group_id,
+                models.GroupMembership.user_id == member_user_id)
+        .first()
+    )
+    if not m:
+        raise HTTPException(status_code=404, detail="Member not found")
+
+    # prevent removing/demoting the last admin
+    if m.role == models.GroupRole.ADMIN:
+        will_deactivate = (payload.is_active is False)
+        will_demote = (payload.role == models.GroupRole.MEMBER)
+        if (will_deactivate or will_demote) and _active_admin_count(db, group_id) <= 1:
+            raise HTTPException(status_code=400, detail="Cannot remove/demote the last admin")
+
+    if payload.role is not None:
+        m.role = payload.role
+    if payload.is_active is not None:
+        m.is_active = payload.is_active
+
+    db.commit()
+    return {"status": "UPDATED"}
+
+
+@app.delete("/api/v1/groups/{group_id}/members/{member_user_id}")
+def remove_member(group_id: int, member_user_id: int, user: user_dependency, db: db_dependency):
+    require_group_role(db, group_id, user.id, roles=[models.GroupRole.ADMIN])
+
+    m = (
+        db.query(models.GroupMembership)
+        .filter(models.GroupMembership.group_id == group_id,
+                models.GroupMembership.user_id == member_user_id,
+                models.GroupMembership.is_active == True)
+        .first()
+    )
+    if not m:
+        raise HTTPException(status_code=404, detail="Active member not found")
+
+    if m.role == models.GroupRole.ADMIN and _active_admin_count(db, group_id) <= 1:
+        raise HTTPException(status_code=400, detail="Cannot remove the last admin")
+
+    m.is_active = False
+    db.commit()
+    return {"status": "REMOVED"}
+
+
+@app.get("/api/v1/groups/{group_id}/invites")
+def list_invites(group_id: int, user: user_dependency, db: db_dependency):
+    require_group_role(db, group_id, user.id, roles=[models.GroupRole.ADMIN])
+
+    invs = (
+        db.query(models.Invitation)
+        .filter(models.Invitation.group_id == group_id)
+        .order_by(models.Invitation.created_at.desc())
+        .all()
+    )
+
+    return [
+        {
+            "id": i.id,
+            "invitee_email": i.invitee_email,
+            "invitee_phone_e164": i.invitee_phone_e164,
+            "status": i.status,
+            "expires_at": i.expires_at.isoformat(),
+            "responded_at": i.responded_at.isoformat() if i.responded_at else None,
+        }
+        for i in invs
+    ]
+
+
+@app.post("/api/v1/groups/{group_id}/invites/{invite_id}/cancel")
+def cancel_invite(group_id: int, invite_id: int, user: user_dependency, db: db_dependency):
+    require_group_role(db, group_id, user.id, roles=[models.GroupRole.ADMIN])
+
+    inv = (
+        db.query(models.Invitation)
+        .filter(models.Invitation.group_id == group_id,
+                models.Invitation.id == invite_id)
+        .first()
+    )
+    if not inv:
+        raise HTTPException(status_code=404, detail="Invite not found")
+
+    if inv.status != models.InviteStatus.PENDING:
+        raise HTTPException(status_code=400, detail=f"Invite is {inv.status}")
+
+    inv.status = models.InviteStatus.CANCELLED
+    inv.responded_at = datetime.now(timezone.utc)
+    db.commit()
+    return {"status": "CANCELLED"}
